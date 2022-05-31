@@ -1,8 +1,9 @@
 import hashlib
 import hmac
 import time
+import bisect
 from copy import copy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Sequence
 
@@ -114,6 +115,7 @@ class DydxGateway(BaseGateway):
     """
     vn.py用于对接dYdX交易所的交易接口。
     """
+    default_name = "DYDX"
 
     default_setting: Dict[str, Any] = {
         "key": "",
@@ -221,6 +223,7 @@ class DydxRestApi(RestClient):
         self.gateway_name: str = gateway.gateway_name
 
         self.order_count: int = 0
+        self.positions: Dict[str, PositionData] = {}
 
     def sign(self, request: Request) -> Request:
         """生成dYdX签名"""
@@ -396,49 +399,81 @@ class DydxRestApi(RestClient):
             "security": Security.PUBLIC
         }
 
-        params: dict = {
-            "resolution": INTERVAL_VT2DYDX[req.interval]
+        # time interval format of
+        TIMEDELTA_MAP: Dict[Interval, timedelta] = {
+            Interval.MINUTE: timedelta(minutes=1),
+            Interval.HOUR: timedelta(hours=1),
+            Interval.DAILY: timedelta(days=1),
         }
+        count = 100
+        start = req.start
+        delta = TIMEDELTA_MAP[req.interval]
 
-        resp: Response = self.request(
-            method="GET",
-            path=f"/v3/candles/{req.symbol}",
-            data=data,
-            params=params
-        )
+        while True:
+            # Calculate end time
+            end = start + delta * (count + 1)
 
-        if resp.status_code // 100 != 2:
-            msg: str = f"获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
-            self.gateway.write_log(msg)
+            params: dict = {
+                "resolution": INTERVAL_VT2DYDX[req.interval],
+                'fromISO': start.astimezone().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                'toISO': end.astimezone().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                'limit': count,
+            }
 
-        else:
-            data: dict = resp.json()
-            if not data:
-                self.gateway.write_log("获取历史数据为空")
+            resp: Response = self.request(
+                method="GET",
+                path=f"/v3/candles/{req.symbol}",
+                data=data,
+                params=params
+            )
 
-            for d in data["candles"]:
+            if resp.status_code // 100 != 2:
+                msg: str = f"获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
+                self.gateway.write_log(msg)
+                return []
 
-                bar: BarData = BarData(
-                    symbol=req.symbol,
-                    exchange=req.exchange,
-                    datetime=generate_datetime(d["startedAt"]),
-                    interval=req.interval,
-                    volume=float(d["baseTokenVolume"]),
-                    open_price=float(d["open"]),
-                    high_price=float(d["high"]),
-                    low_price=float(d["low"]),
-                    close_price=float(d["close"]),
-                    turnover=float(d["usdVolume"]),
-                    open_interest=float(d["startingOpenInterest"]),
-                    gateway_name=self.gateway_name
-                )
-                history.append(bar)
+            else:
+                resp_data: dict = resp.json()
+                if not resp_data:
+                    self.gateway.write_log("获取历史数据为空")
 
-            begin: datetime = history[-1].datetime
-            end: datetime = history[0].datetime
+                buf = []
+                for d in reversed(resp_data["candles"]):
 
-            msg: str = f"获取历史数据成功，{req.symbol} - {req.interval.value}，{begin} - {end}"
-            self.gateway.write_log(msg)
+                    bar: BarData = BarData(
+                        symbol=req.symbol,
+                        exchange=req.exchange,
+                        datetime=utc_to_local(datetime.strptime(d["startedAt"], "%Y-%m-%dT%H:%M:%S.%fZ")),
+                        interval=req.interval,
+                        volume=float(d["baseTokenVolume"]),
+                        open_price=float(d["open"]),
+                        high_price=float(d["high"]),
+                        low_price=float(d["low"]),
+                        close_price=float(d["close"]),
+                        turnover=float(d["usdVolume"]),
+                        open_interest=float(d["startingOpenInterest"]),
+                        gateway_name=self.gateway_name
+                    )
+                    buf.append(bar)
+
+                history.extend(buf)
+                begin: datetime = buf[0].datetime
+                end: datetime = buf[-1].datetime
+
+                msg: str = f"获取历史数据成功，{req.symbol} - {req.interval.value}，{begin} - {end}"
+                self.gateway.write_log(msg)
+
+                # Update start time
+                start = start + delta * len(resp_data["candles"])
+
+                # Break if data end reached
+                if len(buf) < count:
+                    break
+                if req.end is not None and start > req.end:
+                    break
+
+                # Depress the api request rate
+                time.sleep(0.1)
 
         return history
 
@@ -477,6 +512,13 @@ class DydxRestApi(RestClient):
 
         self.gateway.on_account(account)
 
+        # Clear all buf data
+        for position in self.positions.values():
+            position.volume = 0
+            position.frozen = 0
+            position.price = 0
+            position.pnl = 0
+
         for keys in d["openPositions"]:
             position: PositionData = PositionData(
                 symbol=keys,
@@ -489,6 +531,9 @@ class DydxRestApi(RestClient):
             )
             if d["openPositions"][keys]["size"] == "SHORT":
                 position.volume = -position.volume
+            self.positions[keys] = position
+
+        for position in self.positions.values():
             self.gateway.on_position(position)
 
     def on_send_order(self, data: dict, request: Request) -> None:
@@ -541,7 +586,8 @@ class DydxWebsocketApi(WebsocketClient):
         self.gateway_name: str = gateway.gateway_name
 
         self.subscribed: Dict[str, SubscribeRequest] = {}
-        self.orderbooks: Dict[str, "OrderBook"] = {}
+        # self.orderbooks: Dict[str, "OrderBook"] = {}
+        self.tick_stream = DydxTickStream(gateway)
 
     def connect(
         self,
@@ -581,8 +627,9 @@ class DydxWebsocketApi(WebsocketClient):
         self.subscribed[req.vt_symbol] = req
         symbol = req.symbol
 
-        orderbook = OrderBook(symbol, req.exchange, self.gateway)
-        self.orderbooks[symbol] = orderbook
+        self.tick_stream.subscribe(req)
+        # orderbook = OrderBook(symbol, req.exchange, self.gateway)
+        # self.orderbooks[symbol] = orderbook
 
         req: dict = {
             "type": "subscribe",
@@ -591,20 +638,20 @@ class DydxWebsocketApi(WebsocketClient):
         }
         self.send_packet(req)
 
-        history_req: HistoryRequest = HistoryRequest(
-            symbol=symbol,
-            exchange=Exchange.DYDX,
-            start=None,
-            end=None,
-            interval=Interval.DAILY
-        )
+        # history_req: HistoryRequest = HistoryRequest(
+        #     symbol=symbol,
+        #     exchange=Exchange.DYDX,
+        #     start=None,
+        #     end=None,
+        #     interval=Interval.DAILY
+        # )
 
-        history: List[BarData] = self.gateway.query_history(history_req)
+        # history: List[BarData] = self.gateway.query_history(history_req)
 
-        orderbook.open_price = history[0].open_price
-        orderbook.high_price = history[0].high_price
-        orderbook.low_price = history[0].low_price
-        orderbook.last_price = history[0].close_price
+        # orderbook.open_price = history[0].open_price
+        # orderbook.high_price = history[0].high_price
+        # orderbook.low_price = history[0].low_price
+        # orderbook.last_price = history[0].close_price
 
         req: dict = {
             "type": "subscribe",
@@ -644,8 +691,10 @@ class DydxWebsocketApi(WebsocketClient):
         channel: str = packet.get("channel", None)
 
         if channel:
-            if packet["channel"] == "v3_orderbook" or packet["channel"] == "v3_trades":
-                self.on_orderbook(packet)
+            if packet["channel"] == "v3_orderbook":
+                self.tick_stream.on_data(packet)
+            elif packet["channel"] == "v3_trades":
+                self.tick_stream.on_trades(packet)
             elif packet["channel"] == "v3_accounts":
                 self.on_message(packet)
 
@@ -685,6 +734,9 @@ class DydxWebsocketApi(WebsocketClient):
             self.gateway.write_log("账户资金查询成功")
 
         else:
+            for position in packet['contents'].get('positions', []):
+                self.on_position_message(position)
+
             fills = packet["contents"].get("fills", None)
             if not fills:
                 return
@@ -704,6 +756,177 @@ class DydxWebsocketApi(WebsocketClient):
                     gateway_name=self.gateway_name
                 )
                 self.gateway.on_trade(trade)
+
+    def on_position_message(self, data: dict):
+        d = data
+        vt_symbol = "%s.%s" % (d["market"], self.gateway_name)
+        if vt_symbol in self.subscribed:
+            self.gateway.query_account()
+            self.gateway.write_log("position message symbol=%s, volume=%s, side=%s, entry=%s" % (
+                d["market"], d["size"], d["side"], d["entryPrice"]))
+
+
+last_trade = {}
+
+
+class DydxTickStream():
+
+    def __init__(self, gateway):
+        self.gateway = gateway
+        self.gateway_name = gateway.gateway_name
+
+        self.ask_list = {}
+        self.ask_sizes = {}
+
+        self.bid_list = {}
+        self.bid_sizes = {}
+
+        self.codes = set()
+
+    def connect(self) -> None:
+        super().connect()
+
+    def subscribe(self, req: SubscribeRequest) -> int:
+        self.codes.add(req.symbol)
+
+        self.ask_sizes[req.symbol] = {}
+        self.ask_list[req.symbol] = []
+        self.bid_sizes[req.symbol] = {}
+        self.bid_list[req.symbol] = []
+
+        # req_data = {
+        #     'type': 'subscribe',
+        #     'channel': 'v3_orderbook',
+        #     'id': req.symbol,
+        # }
+        # self.send_packet(req_data)
+
+    def on_data(self, packet) -> None:
+        if packet['type'] == 'subscribed':
+            # Reset orderbook buffer
+            self.ask_sizes[packet['id']] = {}
+            self.ask_list[packet['id']] = []
+            self.bid_sizes[packet['id']] = {}
+            self.bid_list[packet['id']] = []
+            # The initial response will contain the state of the orderbook
+            bids = packet['contents']['bids']
+            for bid in reversed(bids):
+                self.bid_list[packet['id']].append(float(bid['price']))
+                self.bid_sizes[packet['id']][float(bid['price'])] = (float(bid['size']), 0)
+
+            asks = packet['contents']['asks']
+            for ask in asks:
+                self.ask_list[packet['id']].append(float(ask['price']))
+                self.ask_sizes[packet['id']][float(ask['price'])] = (float(ask['size']), 0)
+
+        elif packet['type'] == 'channel_data':
+            # print('Tick data %s' % packet)
+            bid_book = self.bid_sizes[packet['id']]
+            bids_diff = packet['contents']['bids']
+            bid_list = self.bid_list[packet['id']]
+            for p, s in bids_diff:
+                bid_price = float(p)
+                bid_size = float(s)
+                index = bisect.bisect_left(bid_list, bid_price)
+                if index != len(bid_list) and bid_list[index] == bid_price:
+                    # update the existing item
+                    if bid_size == 0:
+                        bid_list.pop(index)
+                        bid_book.pop(bid_price)
+                    else:
+                        bid_book[bid_price] = (bid_size, int(packet['contents']['offset']))
+                else:
+                    # insert new price and update order
+                    bisect.insort_left(bid_list, bid_price)
+                    bid_book[bid_price] = (bid_size, int(packet['contents']['offset']))
+
+            ask_book = self.ask_sizes[packet['id']]
+            asks_diff = packet['contents']['asks']
+            ask_list = self.ask_list[packet['id']]
+            for p, s in asks_diff:
+                ask_price = float(p)
+                ask_size = float(s)
+
+                index = bisect.bisect_left(ask_list, ask_price)
+                if index != len(ask_list) and ask_list[index] == ask_price:
+                    # update the existing item
+                    if ask_size == 0:
+                        ask_list.pop(index)
+                        ask_book.pop(ask_price)
+                    else:
+                        ask_book[ask_price] = (ask_size, int(packet['contents']['offset']))
+                else:
+                    # insert new price and update order
+                    bisect.insort_left(ask_list, ask_price)
+                    ask_book[ask_price] = (ask_size, int(packet['contents']['offset']))
+
+            # clean overlap of top bid and ask
+            while len(ask_list) > 0 and len(bid_list) > 0:
+                top_ask = ask_list[0]
+                top_bid = bid_list[-1]
+                if top_bid >= top_ask:
+                    # print("overlap bid %s, ask %s" %(top_bid, top_ask))
+                    # bid and ask overlap, remove older age item
+                    if bid_book[top_bid][1] > ask_book[top_ask][1]:
+                        ask_list.pop(0)
+                        ask_book.pop(top_ask)
+                        # print("TopAsk pop %s" % top_ask)
+                    else:
+                        bid_list.pop(-1)
+                        bid_book.pop(top_bid)
+                        # print("TopBid pop %s" % top_bid)
+                else:
+                    break
+
+            self.on_market_depth(packet['id'])
+
+        else:
+            print('Tick message %s' % packet)
+
+    def on_trades(self, packet) -> None:
+        if packet['type'] == 'subscribed':
+            # The initial response will contain the historical trades
+            trades = packet['contents']['trades']
+            last_trade[packet['id']] = trades[0]
+            # print('Trades history: %s' % json.dumps(trades, indent=2))
+
+        elif packet['type'] == 'channel_data':
+            trades = packet['contents']['trades']
+            last_trade[packet['id']] = trades[-1]
+            # print('Trades event: %s' % trades)
+
+        else:
+            print('Trades message %s' % packet)
+
+    def on_market_depth(self, symbol):
+
+        tick = TickData(
+            symbol=symbol,
+            name=symbol,
+            exchange=Exchange.DYDX,
+            datetime=datetime.now(),
+            gateway_name=self.gateway_name,
+        )
+        if self.bid_list[symbol][-1] >= self.ask_list[symbol][0]:
+            print("order_book overlap!!")
+
+        for n in range(5):
+            price = list(reversed(self.bid_list[symbol]))[n]
+            volume, _ = self.bid_sizes[symbol][price]
+            tick.__setattr__("bid_price_" + str(n + 1), price)
+            tick.__setattr__("bid_volume_" + str(n + 1), volume)
+
+        for n in range(5):
+            price = self.ask_list[symbol][n]
+            volume, _ = self.ask_sizes[symbol][price]
+            tick.__setattr__("ask_price_" + str(n + 1), float(price))
+            tick.__setattr__("ask_volume_" + str(n + 1), float(volume))
+
+        if symbol in last_trade:
+            tick.last_price = float(last_trade[symbol]['price'])
+            tick.last_volume = float(last_trade[symbol]['size'])
+            # print('On tick bid_1=%s, ask_1=%s' % (tick.bid_price_1, tick.ask_price_1))
+            self.gateway.on_tick(tick)
 
 
 class OrderBook():
@@ -858,6 +1081,12 @@ def generate_datetime(timestamp: str) -> datetime:
     dt: datetime = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%S.%fZ')
     dt: datetime = UTC_TZ.localize(dt)
     return dt
+
+
+def utc_to_local(utc_time):
+    tz = datetime.now().astimezone().tzinfo
+    ts = utc_time.replace(tzinfo=timezone.utc)
+    return ts.astimezone(tz)
 
 
 def generate_now_iso() -> str:
