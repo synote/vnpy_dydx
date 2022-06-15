@@ -66,7 +66,8 @@ STATUS_DYDX2VT: Dict[str, Status] = {
     "PENDING": Status.NOTTRADED,
     "OPEN": Status.NOTTRADED,
     "FILLED": Status.ALLTRADED,
-    "CANCELED": Status.CANCELLED
+    "CANCELED": Status.CANCELLED,
+    "UNTRIGGERED": Status.NOTTRADED,
 }
 
 # 委托类型映射
@@ -74,7 +75,14 @@ ORDERTYPE_VT2DYDX: Dict[OrderType, str] = {
     OrderType.LIMIT: "LIMIT",
     OrderType.MARKET: "MARKET"
 }
-ORDERTYPE_DYDX2VT: Dict[str, OrderType] = {v: k for k, v in ORDERTYPE_VT2DYDX.items()}
+
+ORDERTYPE_DYDX2VT: Dict[str, OrderType] = {
+    "LIMIT": OrderType.LIMIT,
+    "STOP_LIMIT": OrderType.STOP,
+    "TRAILING_STOP": OrderType.STOP,
+    "TAKE_PROFIT": OrderType.STOP,
+    "MARKET": OrderType.MARKET,
+}
 
 # 买卖方向映射
 DIRECTION_VT2DYDX: Dict[Direction, str] = {
